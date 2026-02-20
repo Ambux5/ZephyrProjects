@@ -1,0 +1,15 @@
+/* Device tree overlay for NUCLEO-H723ZG board customization */
+
+&zephyr_user {
+	/* Define LED0 - LD1 (green LED on board) */
+	led0 = &ld1;
+};
+
+/* LD1 (green LED on nucleo board) */
+&gpiob {
+	ld1: led_0 {
+		status = "okay";
+		compatible = "gpio-leds";
+		gpios = <0 GPIO_ACTIVE_HIGH>;
+	};
+};
