@@ -1,10 +1,11 @@
 /**
  * @file main.c
- * @brief USB ECM Web Server - Main Application Entry Point
+ * @brief USB Microcontroller Web Configuration Demo
  * 
  * This application demonstrates a web server running over USB ECM
- * (Ethernet Control Model) on an STM32H723 microcontroller.
+ * (Ethernet Control Model) on a microcontroller using Zephyr RTOS.
  * The device presents itself as an Ethernet device to the host.
+ * Supports configuration of network settings and other parameters via web interface.
  */
 
 #include <zephyr/kernel.h>

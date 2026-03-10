@@ -22,39 +22,41 @@ LOG_MODULE_REGISTER(web_server, LOG_LEVEL_INF);
 #define LISTEN_BACKLOG 5
 #define HTTP_THREAD_STACK_SIZE 2048
 #define REQUEST_BUFFER_SIZE 512
-#define RESPONSE_BUFFER_SIZE 1024  /* Minimal buffer for simple HTML pages */
+#define RESPONSE_BUFFER_SIZE 32768  /* 32KB - for full HTML pages with extensive CSS */
+#define MAX_FILE_PATH 256
 
 /* Thread resources */
 static K_THREAD_STACK_DEFINE(http_thread_stack, HTTP_THREAD_STACK_SIZE);
 static struct k_thread http_thread_data;
 
 /**
- * @brief Build HTTP response with proper Content-Length header
+ * @brief Build HTTP response without Content-Length
  * 
- * Creates a complete HTTP response with dynamically calculated Content-Length.
- * Buffer must be large enough for headers + content.
+ * HTTP response using Connection: close instead of Content-Length.
+ * Client will read until connection closes, so no size issues.
  * 
  * @param content HTML content body
+ * @param content_type HTTP Content-Type header
  * @param response_buf Output buffer for complete response
  * @param buf_size Size of response buffer
  * @return Number of bytes written to buffer, or -1 on error
  */
-static int build_http_response(const char *content, char *response_buf, size_t buf_size)
+static int build_http_response(const char *content, const char *content_type,
+                               char *response_buf, size_t buf_size)
 {
-    if (!content || !response_buf) {
+    if (!content || !response_buf || !content_type) {
         return -1;
     }
 
     size_t content_len = strlen(content);
     
-    /* Build HTTP headers with dynamic Content-Length */
+    /* Build HTTP headers WITHOUT Content-Length - use Connection: close instead */
     int header_len = snprintf(response_buf, buf_size,
         "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html; charset=UTF-8\r\n"
-        "Content-Length: %zu\r\n"
+        "Content-Type: %s\r\n"
         "Connection: close\r\n"
         "\r\n",
-        content_len);
+        content_type);
 
     if (header_len < 0 || header_len >= (int)buf_size) {
         LOG_ERR("Failed to build HTTP headers");
@@ -65,6 +67,91 @@ static int build_http_response(const char *content, char *response_buf, size_t b
     if (header_len + content_len >= buf_size) {
         LOG_ERR("Response buffer too small (have %zu, need %zu)",
                 buf_size, header_len + content_len);
+        return -1;
+    }
+
+    memcpy(response_buf + header_len, content, content_len);
+    return header_len + content_len;
+}
+
+/**
+ * @brief Handle static file requests (CSS, JS, etc)
+ * 
+ * @param path Requested file path
+ * @param content_type Output content type
+ * @param response_buf Output response buffer
+ * @param buf_size Size of response buffer
+ * @return Number of bytes in response, or -1 on error
+ */
+static int handle_static_file(const char *path, const char **content_type,
+                              char *response_buf, size_t buf_size)
+{
+    /* Simple routing for Bootstrap files */
+    const char *file_content = NULL;
+    
+    /* Bootstrap CSS - minimal inline version for embedded systems */
+    if (strcmp(path, "/css/bootstrap.min.css") == 0) {
+        *content_type = "text/css";
+        file_content = "body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif}"
+                      ".navbar{background:#0d6efd}.btn{padding:.375rem .75rem;border-radius:.25rem}"
+                      ".card{border:1px solid #ddd;margin:1rem 0}.alert{padding:.75rem;margin:1rem 0}";
+        
+        size_t content_len = strlen(file_content);
+        int header_len = snprintf(response_buf, buf_size,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            *content_type);
+        
+        if (header_len > 0 && header_len + content_len < buf_size) {
+            memcpy(response_buf + header_len, file_content, content_len);
+            return header_len + content_len;
+        }
+    }
+    
+    /* Bootstrap JS - stub for now */
+    if (strcmp(path, "/js/bootstrap.bundle.min.js") == 0) {
+        *content_type = "application/javascript";
+        file_content = "/* Bootstrap JS stub - not implemented in embedded version */";
+        
+        size_t content_len = strlen(file_content);
+        int header_len = snprintf(response_buf, buf_size,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            *content_type);
+        
+        if (header_len > 0 && header_len + content_len < buf_size) {
+            memcpy(response_buf + header_len, file_content, content_len);
+            return header_len + content_len;
+        }
+    }
+    
+    return -1;
+}
+
+/**
+ * @brief Build HTTP 404 response
+ */
+static int build_404_response(char *response_buf, size_t buf_size)
+{
+    const char *content = html_not_found;
+    size_t content_len = strlen(content);
+    
+    int header_len = snprintf(response_buf, buf_size,
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        content_len);
+
+    if (header_len < 0 || header_len >= (int)buf_size) {
+        return -1;
+    }
+
+    if (header_len + content_len >= buf_size) {
         return -1;
     }
 
@@ -186,38 +273,91 @@ static void http_server_thread(void *arg1, void *arg2, void *arg3)
             /* Parse requested path */
             char path[128] = {0};
             const char *content = html_not_found;
+            const char *content_type = "text/html; charset=UTF-8";
 
             if (parse_http_request(req_buf, path, sizeof(path)) == 0) {
                 LOG_INF("Requested path: %s", path);
 
-                /* Route requests */
+                /* Try static files first (CSS, JS, etc) */
+                int static_response = handle_static_file(path, &content_type, response_buf, sizeof(response_buf));
+                if (static_response > 0) {
+                    /* Static file found and response built */
+                    int total_sent = 0;
+                    while (total_sent < static_response) {
+                        ssize_t sent = zsock_send(client_socket, response_buf + total_sent,
+                                                 static_response - total_sent, 0);
+                        if (sent < 0) {
+                            LOG_ERR("Failed to send response: %d", errno);
+                            break;
+                        } else if (sent == 0) {
+                            break;
+                        } else {
+                            total_sent += sent;
+                        }
+                    }
+                    zsock_close(client_socket);
+                    continue;
+                }
+
+                /* Route HTML page requests */
                 if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
                     content = html_index_page;
                     LOG_DBG("Serving index page");
                 } else if (strcmp(path, "/status") == 0) {
                     content = html_status_page;
                     LOG_DBG("Serving status page");
+                } else if (strcmp(path, "/config") == 0) {
+                    content = html_config_page;
+                    LOG_DBG("Serving config page");
                 } else if (strcmp(path, "/info") == 0) {
                     content = html_info_page;
                     LOG_DBG("Serving info page");
                 } else {
                     LOG_WRN("Path not found: %s", path);
+                    /* Build 404 response */
+                    int response_len = build_404_response(response_buf, sizeof(response_buf));
+                    if (response_len > 0) {
+                        int total_sent = 0;
+                        while (total_sent < response_len) {
+                            ssize_t sent = zsock_send(client_socket, response_buf + total_sent,
+                                                     response_len - total_sent, 0);
+                            if (sent < 0) {
+                                LOG_ERR("Failed to send response: %d", errno);
+                                break;
+                            } else if (sent == 0) {
+                                break;
+                            } else {
+                                total_sent += sent;
+                            }
+                        }
+                    }
+                    zsock_close(client_socket);
+                    continue;
                 }
             } else {
                 LOG_ERR("Failed to parse HTTP request");
             }
 
             /* Build complete HTTP response with proper Content-Length */
-            int response_len = build_http_response(content, response_buf, sizeof(response_buf));
+            int response_len = build_http_response(content, content_type, response_buf, sizeof(response_buf));
             
             if (response_len > 0) {
-                /* Send HTTP response */
-                ssize_t sent = zsock_send(client_socket, response_buf, response_len, 0);
-                if (sent < 0) {
-                    LOG_ERR("Failed to send response: %d", errno);
-                } else {
-                    LOG_INF("Sent %d bytes to client", sent);
+                /* Send HTTP response - send all data, looping if needed */
+                int total_sent = 0;
+                while (total_sent < response_len) {
+                    ssize_t sent = zsock_send(client_socket, response_buf + total_sent, 
+                                             response_len - total_sent, 0);
+                    if (sent < 0) {
+                        LOG_ERR("Failed to send response: %d", errno);
+                        break;
+                    } else if (sent == 0) {
+                        LOG_WRN("Socket write returned 0 bytes");
+                        break;
+                    } else {
+                        total_sent += sent;
+                    }
                 }
+                LOG_INF("Sent %d bytes to client (total)", total_sent);
             } else {
                 LOG_ERR("Failed to build HTTP response");
             }
